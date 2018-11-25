@@ -1,5 +1,6 @@
 
-{-# LANGUAGE GADTs, FunctionalDependencies, FlexibleInstances, UndecidableInstances #-}
+{-# LANGUAGE GADTs, FlexibleInstances, UndecidableInstances #-}
+
 
 module Main where
 
@@ -36,11 +37,11 @@ forkIO_ cmd = do forkIO cmd
 
 -- Primitive set of (promise/future) features, specified in terms of a constructor class.
 -- Inspired by Scala FP (= Scala's futures and promises).
-class Base t where
-  newB :: IO (t a)
-  getB :: t a -> IO (Maybe a)
-  tryCompleteB :: t a -> IO (Maybe a) -> IO Bool
-  onCompleteB :: t a -> (Maybe a -> IO ()) -> IO ()   
+class Core t where
+  newC :: IO (t a)
+  getC :: t a -> IO (Maybe a)
+  tryCompleteC :: t a -> IO (Maybe a) -> IO Bool
+  onCompleteC :: t a -> (Maybe a -> IO ()) -> IO ()   
 
 
 
@@ -51,13 +52,15 @@ class Base t where
 -- Via MVar () we signal if promise has been completed.
 data E a b = L a | R b
 
-data BIO a = BIO (IORef (E (Maybe a) [Maybe a -> IO ()]))
+data CIO a = CIO (IORef (E (Maybe a) [Maybe a -> IO ()]))
                  (MVar ())
 
 -- | Eq required to perform CAS on atomic reference.
 -- There is no need to inspect the actual values (value, list of callbacks) because:
 -- 1. Once set, a promise can't be overriden.
 -- 2. We only add callbacks to the list.
+--
+-- Requires FlexibleInstances because of the nested pattern (safe use here).
 instance Eq (E (Maybe a) [Maybe a -> IO ()]) where
   (==) (L _) (R _) = False
   (==) (R _) (L _) = False
@@ -67,18 +70,18 @@ instance Eq (E (Maybe a) [Maybe a -> IO ()]) where
   (==) (L Nothing) (L Nothing) = True
   (==) (R xs) (R ys) = length xs == length ys
 
-instance Base BIO where
-  newB =
+instance Core CIO where
+  newC =
     do x <- newIORef (R [])
        y <- newEmptyMVar
-       return $ BIO x y
+       return $ CIO x y
 
-  getB (BIO x y) =
+  getC (CIO x y) =
     do _ <- readMVar y
        (L v) <- readIORef x
        return v
  
-  tryCompleteB (BIO x y) m = do
+  tryCompleteC (CIO x y) m = do
     v <- m
     let go = do
          val <- readIORef x
@@ -92,7 +95,7 @@ instance Base BIO where
                        else go
     go
 
-  onCompleteB (BIO x _) h = do
+  onCompleteC (CIO x _) h = do
        let go = do val <- readIORef x
                    case val of
                      L v -> do forkIO $ h v
@@ -107,18 +110,18 @@ instance Base BIO where
 
 -- | MVar
 -- Largely similar to atomic reference impl (no spinning, blocking).
-data BMVAR a = BMVAR (MVar (E (Maybe a) [Maybe a -> IO ()]))
+data CMVAR a = CMVAR (MVar (E (Maybe a) [Maybe a -> IO ()]))
                            (MVar ())
 
-instance Base BMVAR where
-   newB = do x <- newMVar (R [])
+instance Core CMVAR where
+   newC = do x <- newMVar (R [])
              y <- newEmptyMVar
-             return $ BMVAR x y
+             return $ CMVAR x y
 
-   getB (BMVAR x y) = do _ <- readMVar y
+   getC (CMVAR x y) = do _ <- readMVar y
                          (L v) <- readMVar x
                          return v
-   tryCompleteB (BMVAR x y) m = do
+   tryCompleteC (CMVAR x y) m = do
         v <- m
         s <- takeMVar x
         case s of
@@ -126,10 +129,10 @@ instance Base BMVAR where
                     return False
           R hs -> do putMVar x (L v)
                      putMVar y ()
-                     forkIO $ mapM_ (\h -> h v) hs
+                     mapM_ (\h -> forkIO $ h v) hs
                      return True
 
-   onCompleteB (BMVAR x y) h = do
+   onCompleteC (CMVAR x y) h = do
        s <- takeMVar x
        case s of
          (L v) -> do putMVar x (L v)
@@ -139,30 +142,30 @@ instance Base BMVAR where
 -- | STM-based implementation
 -- Invariant: Either promise not yet completed, or list of callbacks non-empty.
 -- Signaling done via retry.
-data BSTM a = BSTM (TVar (E (Maybe a) [Maybe a -> IO ()]))
+data CSTM a = CSTM (TVar (E (Maybe a) [Maybe a -> IO ()]))
 
-unPrimSTM (BSTM x) = x
+unPrimSTM (CSTM x) = x
 
-instance Base BSTM where
-   newB = do x <- newTVarIO (R [])
-             return $ BSTM x
+instance Core CSTM where
+   newC = do x <- atomically $ newTVar (R []) -- newTVarIO (R [])
+             return $ CSTM x
 
-   getB (BSTM x) = atomically $ do s <- readTVar x
+   getC (CSTM x) = atomically $ do s <- readTVar x
                                    case s of
                                      R _ -> retry
                                      L v -> return v
 
-   tryCompleteB (BSTM x) m = do
+   tryCompleteC (CSTM x) m = do
        v <- m
        action <- atomically $ do s <- readTVar x
                                  case s of
                                     R hs -> do writeTVar x (L v)
-                                               return $ do forkIO $ mapM_ (\h -> h v) hs
+                                               return $ do mapM_ (\h -> forkIO $ h v) hs
                                                            return True
                                     L _ -> return (return False)
        action
                                          
-   onCompleteB (BSTM x) h = do
+   onCompleteC (CSTM x) h = do
       action <- atomically $ do s <- readTVar x
                                 case s of
                                   (R hs) -> do writeTVar x $ R (h:hs)
@@ -204,11 +207,14 @@ class FP t where
 
 
 
-instance Base t => FP t where
-    new = newB
-    trySuccess p x = tryCompleteB p (return $ Just x)
-    tryFail p = tryCompleteB p (return Nothing)
-    tryComplete = tryCompleteB
+-- Requires UndecidableInstaces as the context constraint Core t is no smaller than the instead head FP t.
+-- For our uses, the instance declaration is safe.
+-- Requires FlexibleInstances because in instead head FP t, t is a plain variable (safe use here).
+instance Core t => FP t where
+    new = newC
+    trySuccess p x = tryCompleteC p (return $ Just x)
+    tryFail p = tryCompleteC p (return Nothing)
+    tryComplete = tryCompleteC
     trySuccWith p f =
         onSuccess f (\x -> do trySuccess p x
                               return ())
@@ -224,13 +230,13 @@ instance Base t => FP t where
         tryFailWith p f
 -}
 
-    future_ h = do p <- newB
+    future_ h = do p <- newC
                    forkIO $ do tryComplete p (h ())
                                return ()
                    return p
     future f = future_ (\() -> f)
-    get = getB
-    onComplete f h = onCompleteB f h
+    get = getC
+    onComplete f h = onCompleteC f h
     onSuccess f h = onComplete  f (\x -> case x of
                                            Nothing -> return ()
                                            Just v -> h v)
@@ -365,13 +371,13 @@ instance Base t => FP t where
 
 -- Benchmarks
 
-bio :: BIO a
+bio :: CIO a
 bio = undefined
 
-bstm :: BSTM a
+bstm :: CSTM a
 bstm = undefined
 
-bmvar :: BMVAR a
+bmvar :: CMVAR a
 bmvar = undefined
 
 -- Measures high/low contention
@@ -386,21 +392,21 @@ bmvar = undefined
 -- wait for counter to reach n*m (all onCompletes are processed)
 perf1 n m k q = do
          x <- newTVarIO 0
-         ps <- mapM (\_ -> newB) [1..n]
+         ps <- mapM (\_ -> newC) [1..n]
          let qs = q:ps -- trick to force type
          let ps' = ps
-         let cmd = mapM_ (\p-> onCompleteB p (\_ -> do atomically $ do v <- readTVar x
+         let cmd = mapM_ (\p-> onCompleteC p (\_ -> do atomically $ do v <- readTVar x
                                                                        writeTVar x (v+1)
                                                        -- putStrLn "doo"
                                              ))
                                     ps'
          mapM_ (\_ -> forkIO cmd) [1..m]
 
-         let ts = mapM_ (\p -> tryCompleteB p (return $ Just 1)) ps
+         let ts = mapM_ (\p -> tryCompleteC p (return $ Just 1)) ps
 
          mapM_ (\_ -> forkIO ts) [1..k]
 
-         mapM_ getB ps  -- XX
+         mapM_ getC ps  -- XX
          atomically $ do v <- readTVar x
                          if v < n*m
                           then retry
@@ -416,14 +422,14 @@ perf1 n m k q = do
 --  tryComplete p1
 -- get pn
 perf2 n q = do
-            ps <- mapM (\_ -> newB) [1..n]
+            ps <- mapM (\_ -> newC) [1..n]
             let qs = q:ps -- trick to force type
-            let go (p1:p2:ps) = onCompleteB p1 (\_ -> do tryCompleteB p2 (return $ Just 1)
+            let go (p1:p2:ps) = onCompleteC p1 (\_ -> do tryCompleteC p2 (return $ Just 1)
                                                          go (p2:ps))
-                go [p] = onCompleteB p (\_ -> return ())
+                go [p] = onCompleteC p (\_ -> return ())
             go ps
-            tryCompleteB (head ps) (return $ Just 1)
-            _ <- getB (last ps)
+            tryCompleteC (head ps) (return $ Just 1)
+            _ <- getC (last ps)
             return ()
 
 
@@ -434,15 +440,15 @@ perf2 n q = do
 --    ...
 ---   tryComplete p1
 perf3 n q = do
-            ps <- mapM (\_ -> newB) [1..n]
+            ps <- mapM (\_ -> newC) [1..n]
             let qs = q:ps -- trick to force type
-            let go (p1:p2:ps) = do onCompleteB p1 (\_ -> do do tryCompleteB p2 (return $ Just 1)
+            let go (p1:p2:ps) = do onCompleteC p1 (\_ -> do do tryCompleteC p2 (return $ Just 1)
                                                                return ())
                                    go (p2:ps)
-                go [p] = onCompleteB p (\_ -> return ())
+                go [p] = onCompleteC p (\_ -> return ())
             go ps
-            tryCompleteB (head ps) (return $ Just 1)
-            _ <- getB (last ps)
+            tryCompleteC (head ps) (return $ Just 1)
+            _ <- getC (last ps)
             return ()
 
 
@@ -466,11 +472,11 @@ runTest n test = do rs <- mapM (\_ -> execTest test) [1..n]
 
 
 runAll n t1 t2 t3 = do
-                   putStrLn "BIO"
+                   putStrLn "CIO"
                    runTest n t1
-                   putStrLn "BMVAR"
+                   putStrLn "CMVAR"
                    runTest n t2
-                   putStrLn "BSTM"
+                   putStrLn "CSTM"
                    runTest n t3
 
 
