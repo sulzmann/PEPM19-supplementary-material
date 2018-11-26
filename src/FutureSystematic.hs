@@ -90,7 +90,7 @@ instance Core CIO where
            R hs -> do b <- cas x val (L v)
                       if b
                        then do putMVar y ()
-                               forkIO $ mapM_ (\h -> h v) hs
+                               mapM_ (\h -> forkIO $ h v) hs
                                return True
                        else go
     go
